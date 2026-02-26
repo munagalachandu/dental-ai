@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+opencv-python
+numpy
+torch==2.1.2
+pillow
