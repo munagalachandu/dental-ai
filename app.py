@@ -5,13 +5,12 @@ from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor
 from detectron2 import model_zoo
 
-from config import *
-from measurement_utils import *
-from implant_logic import *
-
 app = FastAPI()
 
-# Load model once
+BASE_PIXEL_SIZE = 0.0825
+DEFAULT_ZOOM = 0.78
+
+# ================= LOAD MODEL =================
 cfg = get_cfg()
 cfg.merge_from_file(
     model_zoo.get_config_file(
@@ -24,6 +23,67 @@ cfg.MODEL.DEVICE = "cpu"
 
 predictor = DefaultPredictor(cfg)
 
+# ================= HELPERS =================
+
+def polygon_from_mask(mask):
+    contours, _ = cv2.findContours(mask.astype("uint8"),
+                                   cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        return None
+    return max(contours, key=cv2.contourArea).reshape(-1, 2)
+
+
+def calc_height(polygon):
+    pts = polygon.astype(np.float32)
+    center = np.mean(pts, axis=0)
+    pts_centered = pts - center
+
+    cov = np.cov(pts_centered.T)
+    eigvals, eigvecs = np.linalg.eig(cov)
+    axis = eigvecs[:, np.argmax(eigvals)]
+
+    projections = pts_centered @ axis
+    min_proj, max_proj = np.min(projections), np.max(projections)
+
+    p1 = center + axis * min_proj
+    p2 = center + axis * max_proj
+
+    top, bottom = (p1, p2) if p1[1] < p2[1] else (p2, p1)
+    return np.linalg.norm(bottom - top), top, bottom
+
+
+def calc_width(mask, top, bottom, mm_to_px, offset_mm):
+
+    h_vec = bottom - top
+    h_unit = h_vec / np.linalg.norm(h_vec)
+
+    offset_px = offset_mm * mm_to_px
+    point = top + h_unit * offset_px
+    cx, cy = int(point[0]), int(point[1])
+
+    p_vec = np.array([-h_unit[1], h_unit[0]])
+
+    pts = []
+    for t in np.linspace(-500, 500, 2000):
+        x = int(cx + p_vec[0] * t)
+        y = int(cy + p_vec[1] * t)
+        if 0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]:
+            if mask[y, x] == 1:
+                pts.append((x, y))
+
+    if len(pts) < 2:
+        return 0
+
+    left = np.array(pts[0])
+    right = np.array(pts[-1])
+    return np.linalg.norm(right - left)
+
+
+def recommend_implant(height_mm, width_mm):
+    return max(width_mm - 3, 0), height_mm
+
+# ================= ROUTES =================
 
 @app.get("/")
 def health():
@@ -33,10 +93,9 @@ def health():
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
-    zoom: float = Form(DEFAULT_ZOOM)   # 👈 USER INPUT
+    zoom: float = Form(DEFAULT_ZOOM)
 ):
 
-    # If zoom invalid → fallback
     if zoom <= 0:
         zoom = DEFAULT_ZOOM
 
